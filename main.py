@@ -14,10 +14,7 @@ Base URL precedence:
   3) Default: Flask builds URL from the incoming request
 
 CLI:
-  python main.py --host 0.0.0.0 --port 4684 \
-    --external-base-url http://gallery.ikubaysan.com:4648 \
-    --tts-voice "us2" \
-    --force-recreate
+  python main.py --host 0.0.0.0 --port 4684 --external-base-url http://gallery.ikubaysan.com:4648 --tts-voice "us2" --force-recreate
 """
 
 from __future__ import annotations
