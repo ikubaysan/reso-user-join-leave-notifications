@@ -2,9 +2,9 @@
 """
 Flask TTS API (OGG output, ALWAYS new file per request, UUID filenames).
 
-Supports two engines:
+Engines:
   - pyttsx3 (offline, system voices)
-  - gTTS (Google Translate TTS, free, no API key; requires internet)
+  - gTTS (Google Translate TTS, no API key; requires internet)
 
 Filename format (no caching):
   <uuid>_<username>_<action>.ogg
@@ -15,30 +15,32 @@ HTTP:
       [&engine=<pyttsx3|gtts>]
       [&lang=<gtts lang code>]
       [&tld=<gtts tld>]
-  → {"url": "<absolute URL to .ogg file>", "filename": "...ogg", "engine": "gtts|pyttsx3"}
+  → RETURNS PLAIN TEXT: "<absolute URL to .ogg file>"
 
   GET /api/voices
   → If engine=pyttsx3: JSON list of system voices (index/id/name/languages)
     If engine=gtts: JSON of available languages and current tld
 
-Base URL precedence:
-  1) Query param base_url (per-request override)
-  2) CLI flag --external-base-url
-  3) Default: Flask builds URL from the incoming request
+Cleanup:
+  After each generate, keep only the newest X .ogg files in static/audio.
+  X is controlled by --max-files (default: 50).
 
 CLI examples:
-  # Use gTTS with US English voice style (Google Translate)
+  # gTTS (free, no key)
   python main.py --engine gtts --gtts-lang en --gtts-tld com
 
-  # Use pyttsx3 with a specific index (Linux deterministic)
+  # pyttsx3 with specific voice index
   python main.py --engine pyttsx3 --tts-voice-index 28
+
+  # keep only the newest 20 files
+  python main.py --max-files 20
 """
 
 from __future__ import annotations
 import os, re, threading, argparse, json, uuid
-from typing import Final, Literal, Optional, Tuple, List, Any, Dict
+from typing import Final, Literal, Optional, Tuple, List, Any
 from urllib.parse import urljoin
-from flask import Flask, jsonify, request, url_for, abort
+from flask import Flask, jsonify, request, url_for, abort, Response
 import pyttsx3
 from pydub import AudioSegment
 
@@ -56,7 +58,7 @@ EngineName = Literal["pyttsx3", "gtts"]
 
 # ---------- CLI PARSER ----------
 
-def parse_args() -> Tuple[str, int, str, EngineName, str, Optional[int], str, str]:
+def parse_args() -> Tuple[str, int, str, EngineName, str, Optional[int], str, str, int]:
     parser = argparse.ArgumentParser(description="Start the TTS Flask server.")
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind (default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=4684, help="Port to bind (default: 4684)")
@@ -104,6 +106,15 @@ def parse_args() -> Tuple[str, int, str, EngineName, str, Optional[int], str, st
         help="(gTTS) Accent domain like 'com', 'co.uk', 'com.au' (default: com)."
     )
 
+    # Cleanup options
+    parser.add_argument(
+        "--max-files",
+        dest="max_files",
+        type=int,
+        default=50,
+        help="Maximum number of .ogg files to keep in static/audio (default: 50)."
+    )
+
     args = parser.parse_args()
     return (
         args.host,
@@ -114,6 +125,7 @@ def parse_args() -> Tuple[str, int, str, EngineName, str, Optional[int], str, st
         args.tts_voice_index,
         args.gtts_lang.strip(),
         args.gtts_tld.strip(),
+        int(args.max_files) if args.max_files and args.max_files > 0 else 50,
     )
 
 
@@ -154,6 +166,33 @@ def build_file_url(app: Flask, rel_static_path: str, base_url_override: Optional
     if base_url_override and is_valid_base_url(base_url_override):
         return urljoin(base_url_override.rstrip('/') + '/', static_path.lstrip('/'))
     return url_for("static", filename=rel_static_path.replace("\\", "/"), _external=True)
+
+def cleanup_audio_dir(audio_dir: str, max_files: int) -> None:
+    """Keep only the newest `max_files` .ogg files; delete older ones."""
+    try:
+        entries = []
+        for name in os.listdir(audio_dir):
+            if not name.lower().endswith(".ogg"):
+                continue
+            full = os.path.join(audio_dir, name)
+            try:
+                st = os.stat(full)
+                entries.append((st.st_mtime, full))
+            except Exception:
+                # Skip if we can't stat
+                continue
+
+        # Sort newest first by mtime
+        entries.sort(key=lambda t: t[0], reverse=True)
+
+        # Delete beyond the cap
+        for _, path in entries[max_files:]:
+            try:
+                os.remove(path)
+            except Exception as e:
+                print(f"[cleanup] Failed to delete {path}: {e}")
+    except Exception as e:
+        print(f"[cleanup] Error cleaning audio dir: {e}")
 
 
 # ---------- CORE CLASSES ----------
@@ -287,7 +326,6 @@ class GTTSGenerator(BaseTTS):
         # gTTS doesn't expose voices, only languages. Return that info + tld.
         try:
             langs = gtts_langs() if gtts_langs else {}
-            # Flatten to key -> name
             entries = [{"lang": k, "name": v} for k, v in sorted(langs.items(), key=lambda kv: kv[0])]
             return [{"engine": "gtts", "tld": self.tld, "languages": entries}]
         except Exception as e:
@@ -312,17 +350,25 @@ class GTTSGenerator(BaseTTS):
 
 
 class AudioService:
-    def __init__(self, audio_dir: str, tts_engine: BaseTTS) -> None:
+    def __init__(self, audio_dir: str, tts_engine: BaseTTS, max_files: int) -> None:
         self.audio_dir: Final[str] = audio_dir
         self.tts: Final[BaseTTS] = tts_engine
+        self.max_files: Final[int] = max_files
 
     def create_audio(self, username: str, action: str) -> Tuple[str, str]:
+        """Always create a brand new audio file. Returns (absolute_path, filename)."""
         ensure_dir(self.audio_dir)
+
         act = action.strip().lower()
         if act not in ("join", "leave"):
             raise ValueError("Parameter 'action' must be 'join' or 'leave'.")
+
         spec = AudioSpec(username_raw=username, action=act, audio_dir=self.audio_dir)
         ogg_path = self.tts.generate_ogg(spec)
+
+        # Cleanup after successful generation
+        cleanup_audio_dir(self.audio_dir, self.max_files)
+
         return ogg_path, spec.filename
 
 
@@ -335,6 +381,7 @@ def create_app(
     tts_voice_index: Optional[int] = None,
     gtts_lang_code: str = "en",
     gtts_tld: str = "com",
+    max_files: int = 50,
 ) -> Flask:
     root, audio_dir = project_paths()
     app = Flask(__name__, static_url_path="/static", static_folder=os.path.join(root, "static"))
@@ -344,6 +391,7 @@ def create_app(
     app.config["GTTS_TLD"] = gtts_tld
     app.config["PYTTSX3_VOICE"] = tts_voice
     app.config["PYTTSX3_VOICE_INDEX"] = tts_voice_index
+    app.config["MAX_FILES"] = max_files
 
     # Build default engine
     if engine_name == "gtts":
@@ -351,7 +399,7 @@ def create_app(
     else:
         tts_engine = PyTTSX3Generator(prefer_voice_substr=(tts_voice or ""), voice_index=tts_voice_index)
 
-    service = AudioService(audio_dir=audio_dir, tts_engine=tts_engine)
+    service = AudioService(audio_dir=audio_dir, tts_engine=tts_engine, max_files=max_files)
 
     @app.get("/api/tts")
     def tts_endpoint():
@@ -379,13 +427,13 @@ def create_app(
             lang = (req_lang or app.config["GTTS_LANG"])
             tld = (req_tld or app.config["GTTS_TLD"])
             local_tts = GTTSGenerator(lang=lang, tld=tld)
-            local_service = AudioService(audio_dir=service.audio_dir, tts_engine=local_tts)
+            local_service = AudioService(audio_dir=service.audio_dir, tts_engine=local_tts, max_files=app.config["MAX_FILES"])
         elif current_engine_name == "pyttsx3" and req_engine == "pyttsx3":
             # Reuse default pyttsx3 config (no per-request options exposed here)
             pass
 
         try:
-            ogg_path, filename = local_service.create_audio(username=username, action=action)
+            ogg_path, _filename = local_service.create_audio(username=username, action=action)
         except ValueError as e:
             return abort(400, description=str(e))
         except Exception as e:
@@ -395,7 +443,9 @@ def create_app(
         rel_path = os.path.relpath(ogg_path, static_folder).replace("\\", "/")
         base_override = per_request_base or app.config.get("EXTERNAL_BASE_URL") or None
         file_url = build_file_url(app, rel_path, base_override)
-        return jsonify({"url": file_url, "filename": filename, "engine": current_engine_name}), 200
+
+        # Return PLAIN TEXT ONLY (no JSON)
+        return Response(file_url, status=200, mimetype="text/plain")
 
     @app.get("/api/voices")
     def list_voices():
@@ -424,7 +474,7 @@ def create_app(
             ensure_dir(os.path.join(app.static_folder, "audio"))
         except Exception:
             pass
-        return jsonify({"ok": True, "engine": app.config["ENGINE_NAME"]}), 200
+        return jsonify({"ok": True, "engine": app.config["ENGINE_NAME"], "max_files": app.config["MAX_FILES"]}), 200
 
     return app
 
@@ -432,7 +482,9 @@ def create_app(
 # ---------- ENTRYPOINT ----------
 
 if __name__ == "__main__":
-    host, port, external_base_url, engine_name, tts_voice, tts_voice_index, gtts_lang_code, gtts_tld = parse_args()
+    (host, port, external_base_url, engine_name, tts_voice, tts_voice_index,
+     gtts_lang_code, gtts_tld, max_files) = parse_args()
+
     app = create_app(
         external_base_url=external_base_url,
         engine_name=engine_name,
@@ -440,5 +492,6 @@ if __name__ == "__main__":
         tts_voice_index=tts_voice_index,
         gtts_lang_code=gtts_lang_code,
         gtts_tld=gtts_tld,
+        max_files=max_files,
     )
     app.run(host=host, port=port, debug=False)
