@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 """
-Play a short sample with EVERY available pyttsx3 voice.
-Re-initializes the engine per voice to ensure the change takes effect.
+Play or list all available pyttsx3 voices.
+
+Examples:
+  # Just list voices (no audio)
+  ./list_voices.py
+
+  # List and play sample for each voice
+  ./list_voices.py --play
 """
 
 from __future__ import annotations
-
+import argparse
 import time
 import pyttsx3
 
@@ -14,7 +20,6 @@ def speak_with_voice(voice_id: str, text: str, rate_delta: int = 0, volume: floa
     """Init a fresh engine, set the voice, then speak."""
     engine = pyttsx3.init()
     try:
-        # Optional tuning (kept conservative)
         if rate_delta:
             rate = engine.getProperty("rate") or 200
             engine.setProperty("rate", rate + rate_delta)
@@ -25,7 +30,6 @@ def speak_with_voice(voice_id: str, text: str, rate_delta: int = 0, volume: floa
         engine.say(text)
         engine.runAndWait()
     finally:
-        # Ensure we release resources between voices
         try:
             engine.stop()
         except Exception:
@@ -33,12 +37,12 @@ def speak_with_voice(voice_id: str, text: str, rate_delta: int = 0, volume: floa
         del engine
 
 
-def list_and_test_all_voices(sample_text: str = "Hello! This is my voice.") -> None:
-    # Use a temp engine just to enumerate voices
+def list_and_test_all_voices(sample_text: str = "Hello! This is my voice.", play: bool = False) -> None:
+    """List all voices, and optionally play a sample."""
     probe = pyttsx3.init()
     voices = probe.getProperty("voices")
     print(f"Found {len(voices)} voices.\n")
-    # Capture a light snapshot of metadata up front
+
     metadata = []
     for i, v in enumerate(voices):
         meta = {
@@ -54,18 +58,24 @@ def list_and_test_all_voices(sample_text: str = "Hello! This is my voice.") -> N
         pass
     del probe
 
-    # Speak with each voice (fresh engine each time)
     for m in metadata:
         idx, vid, name, langs = m["index"], m["id"], m["name"], m["languages"]
         print(f"[{idx}] {name} ({vid})  Langs: {langs}")
-        try:
-            speak_with_voice(vid, sample_text)
-        except Exception as e:
-            print(f"  -> Skipped due to error: {e}")
-        time.sleep(0.3)  # small pause between voices
+        if play:
+            try:
+                speak_with_voice(vid, sample_text)
+            except Exception as e:
+                print(f"  -> Skipped due to error: {e}")
+            time.sleep(0.3)
 
-    print("\nAll voices attempted.")
+    print("\nAll voices listed." if not play else "\nAll voices attempted.")
 
 
 if __name__ == "__main__":
-    list_and_test_all_voices("Hello! This is a test of my voice.")
+    parser = argparse.ArgumentParser(description="List or test all available pyttsx3 voices.")
+    parser.add_argument("--play", action="store_true", help="Play each voice sample aloud.")
+    parser.add_argument("--text", type=str, default="Hello! This is a test of my voice.",
+                        help="Sample text to use when playing voices.")
+    args = parser.parse_args()
+
+    list_and_test_all_voices(args.text, play=args.play)
