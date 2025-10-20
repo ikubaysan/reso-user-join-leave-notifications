@@ -1,24 +1,31 @@
 #!/usr/bin/env python3
 """
-Flask TTS API (OGG output, cached by username+action) with CLI flags.
+Flask TTS API (OGG output, ALWAYS new file per request, UUID filenames).
 
-GET /api/tts?username=<str>&action=<join|leave>[&base_url=<http(s)://host:port>][&force=1]
-→ {"url": "<absolute URL to .ogg file>"}
+GET /api/tts?username=<str>&action=<join|leave>[&base_url=<http(s)://host:port>]
+→ {"url": "<absolute URL to .ogg file>", "filename": "<uuid>_<username>_<action>.ogg"}
 
 GET /api/voices
 → JSON list of voices available to pyttsx3 (index, id, name, languages if available)
+
+Filename format (no caching):
+  <uuid>_<username>_<action>.ogg
 
 Base URL precedence:
   1) Query param base_url (per-request override)
   2) CLI flag --external-base-url
   3) Default: Flask builds URL from the incoming request
 
-CLI:
-  python main.py --host 0.0.0.0 --port 4684 --external-base-url http://gallery.ikubaysan.com:4648 --tts-voice "us2" --force-recreate
+CLI examples:
+  python main.py --host 0.0.0.0 --port 4684 \
+    --external-base-url http://gallery.ikubaysan.com:4648 \
+    --tts-voice-index 28
+
+  python main.py --tts-voice "us2"   # try MBROLA US2 (female-ish) via substring on Linux
 """
 
 from __future__ import annotations
-import os, re, threading, argparse, json
+import os, re, threading, argparse, json, uuid
 from typing import Final, Literal, Optional, Tuple, List, Any
 from urllib.parse import urljoin
 from flask import Flask, jsonify, request, url_for, abort
@@ -30,7 +37,7 @@ Action = Literal["join", "leave"]
 
 # ---------- CLI PARSER ----------
 
-def parse_args() -> Tuple[str, int, str, str, Optional[int], bool]:
+def parse_args() -> Tuple[str, int, str, str, Optional[int]]:
     parser = argparse.ArgumentParser(description="Start the TTS Flask server.")
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind (default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=4684, help="Port to bind (default: 4684)")
@@ -54,11 +61,6 @@ def parse_args() -> Tuple[str, int, str, str, Optional[int], bool]:
         default=None,
         help="Pick a voice by numeric index (as listed by /api/voices). Deterministic on Linux."
     )
-    parser.add_argument(
-        "--force-recreate",
-        action="store_true",
-        help="Force re-generate audio even if the .ogg already exists."
-    )
     args = parser.parse_args()
     return (
         args.host,
@@ -66,7 +68,6 @@ def parse_args() -> Tuple[str, int, str, str, Optional[int], bool]:
         args.external_base_url.strip(),
         args.tts_voice.strip(),
         args.tts_voice_index,
-        args.force_recreate,
     )
 
 
@@ -125,18 +126,24 @@ class AudioSpec:
         self.username_raw = username_raw
         self.action = action
         self.audio_dir = audio_dir
+        self._uuid = str(uuid.uuid4())
 
     @property
     def username_safe(self) -> str:
         return sanitize_username(self.username_raw)
 
     @property
+    def filename(self) -> str:
+        # <uuid>_<username>_<action>.ogg
+        return f"{self._uuid}_{self.username_safe}_{self.action}.ogg"
+
+    @property
     def ogg_path(self) -> str:
-        return os.path.join(self.audio_dir, f"{self.action}_{self.username_safe}.ogg")
+        return os.path.join(self.audio_dir, self.filename)
 
     @property
     def tmp_wav_path(self) -> str:
-        return os.path.join(self.audio_dir, f".tmp_{self.action}_{self.username_safe}.wav")
+        return os.path.join(self.audio_dir, f".tmp_{self._uuid}.wav")
 
     @property
     def phrase(self) -> str:
@@ -228,9 +235,8 @@ class TTSGenerator:
         audio.export(ogg_path, format="ogg")
 
     def generate_ogg(self, spec: AudioSpec) -> str:
-        # Recreate audio dir if it was removed during runtime
+        # Always generate a fresh file (no caching)
         ensure_dir(spec.audio_dir)
-
         self.synthesize_to_wav(spec.phrase, spec.tmp_wav_path)
         try:
             self.wav_to_ogg(spec.tmp_wav_path, spec.ogg_path)
@@ -244,33 +250,21 @@ class TTSGenerator:
 
 
 class AudioService:
-    def __init__(self, audio_dir: str, tts: Optional[TTSGenerator] = None, force_recreate: bool = False) -> None:
+    def __init__(self, audio_dir: str, tts: Optional[TTSGenerator] = None) -> None:
         self.audio_dir: Final[str] = audio_dir
         self.tts: Final[TTSGenerator] = tts or TTSGenerator()
-        self.force_recreate_default: Final[bool] = force_recreate
 
-    def get_or_create_audio(self, username: str, action: str, force: Optional[bool] = None) -> str:
-        # Ensure audio folder still exists at request time
+    def create_audio(self, username: str, action: str) -> Tuple[str, str]:
+        """Always create a brand new audio file. Returns (absolute_path, filename)."""
         ensure_dir(self.audio_dir)
 
         act = action.strip().lower()
         if act not in ("join", "leave"):
             raise ValueError("Parameter 'action' must be 'join' or 'leave'.")
+
         spec = AudioSpec(username_raw=username, action=act, audio_dir=self.audio_dir)
-
-        force_flag = self.force_recreate_default if force is None else bool(force)
-
-        # If forcing recreate, delete any existing ogg
-        if force_flag and os.path.exists(spec.ogg_path):
-            try:
-                os.remove(spec.ogg_path)
-            except Exception as e:
-                print(f"[AudioService] Failed to remove existing file for force recreate: {e}")
-
-        if os.path.exists(spec.ogg_path):
-            return spec.ogg_path
-
-        return self.tts.generate_ogg(spec)
+        ogg_path = self.tts.generate_ogg(spec)
+        return ogg_path, spec.filename
 
 
 # ---------- FLASK FACTORY ----------
@@ -279,7 +273,6 @@ def create_app(
     external_base_url: str = "",
     tts_voice: str = "",
     tts_voice_index: Optional[int] = None,
-    force_recreate: bool = False,
 ) -> Flask:
     root, audio_dir = project_paths()
     app = Flask(__name__, static_url_path="/static", static_folder=os.path.join(root, "static"))
@@ -287,24 +280,19 @@ def create_app(
 
     # Init TTS with the user preferences
     tts = TTSGenerator(prefer_voice_substr=(tts_voice or ""), voice_index=tts_voice_index)
-    service = AudioService(audio_dir=audio_dir, tts=tts, force_recreate=force_recreate)
+    service = AudioService(audio_dir=audio_dir, tts=tts)
 
     @app.get("/api/tts")
     def tts_endpoint():
         username = request.args.get("username", type=str)
         action = request.args.get("action", type=str)
         per_request_base = (request.args.get("base_url", type=str) or "").strip()
-        per_request_force = request.args.get("force", type=str)
 
         if not username or not action:
             return abort(400, description="Missing 'username' or 'action'.")
 
-        force_flag: Optional[bool] = None
-        if per_request_force is not None:
-            force_flag = per_request_force in ("1", "true", "True", "yes", "on")
-
         try:
-            ogg_path = service.get_or_create_audio(username=username, action=action, force=force_flag)
+            ogg_path, filename = service.create_audio(username=username, action=action)
         except ValueError as e:
             return abort(400, description=str(e))
         except Exception as e:
@@ -314,7 +302,7 @@ def create_app(
         rel_path = os.path.relpath(ogg_path, static_folder).replace("\\", "/")
         base_override = per_request_base or app.config.get("EXTERNAL_BASE_URL") or None
         file_url = build_file_url(app, rel_path, base_override)
-        return jsonify({"url": file_url}), 200
+        return jsonify({"url": file_url, "filename": filename}), 200
 
     @app.get("/api/voices")
     def list_voices():
@@ -343,11 +331,10 @@ def create_app(
 # ---------- ENTRYPOINT ----------
 
 if __name__ == "__main__":
-    host, port, external_base_url, tts_voice, tts_voice_index, force_recreate = parse_args()
+    host, port, external_base_url, tts_voice, tts_voice_index = parse_args()
     app = create_app(
         external_base_url=external_base_url,
         tts_voice=tts_voice,
         tts_voice_index=tts_voice_index,
-        force_recreate=force_recreate,
     )
     app.run(host=host, port=port, debug=False)
