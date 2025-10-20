@@ -11,7 +11,7 @@ Base URL precedence:
   3) Default: Flask builds URL from the incoming request
 
 CLI:
-  python app.py --host 0.0.0.0 --port 4684 --external-base-url http://gallery.ikubaysan.com:4648
+  python app.py --host 0.0.0.0 --port 4684 --external-base-url http://gallery.ikubaysan.com:4648 --tts-voice "zira"
 """
 
 from __future__ import annotations
@@ -27,10 +27,12 @@ Action = Literal["join", "leave"]
 
 # ---------- CLI PARSER ----------
 
-def parse_args() -> Tuple[str, int, str]:
+def parse_args() ->  Tuple[str, int, str, str]:
     parser = argparse.ArgumentParser(description="Start the TTS Flask server.")
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind (default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=4684, help="Port to bind (default: 4684)")
+    parser.add_argument("--tts-voice", dest="tts_voice", default="",
+                        help="Preferred TTS voice (substring or exact id), case-insensitive. Examples: 'zira', 'english-us', 'fiona'")
     parser.add_argument(
         "--external-base-url",
         default="",
@@ -38,7 +40,7 @@ def parse_args() -> Tuple[str, int, str]:
              "(e.g., http://gallery.ikubaysan.com:4648).",
     )
     args = parser.parse_args()
-    return args.host, args.port, args.external_base_url.strip()
+    return args.host, args.port, args.external_base_url.strip(), args.tts_voice.strip()
 
 
 # ---------- UTILITIES ----------
@@ -194,11 +196,12 @@ class AudioService:
 
 # ---------- FLASK FACTORY ----------
 
-def create_app(external_base_url: str = "") -> Flask:
+
+def create_app(external_base_url: str = "", tts_voice: str = "") -> Flask:
     root, audio_dir = project_paths()
     app = Flask(__name__, static_url_path="/static", static_folder=os.path.join(root, "static"))
     app.config["EXTERNAL_BASE_URL"] = external_base_url
-    service = AudioService(audio_dir=audio_dir, tts=TTSGenerator(prefer_voice_substr="zira"))
+    service = AudioService(audio_dir=audio_dir, tts=TTSGenerator(prefer_voice_substr=(tts_voice or "zira")))
 
     @app.get("/api/tts")
     def tts_endpoint():
@@ -235,8 +238,7 @@ def create_app(external_base_url: str = "") -> Flask:
 
 
 # ---------- ENTRYPOINT ----------
-
 if __name__ == "__main__":
-    host, port, external_base_url = parse_args()
-    app = create_app(external_base_url)
+    host, port, external_base_url, tts_voice = parse_args()
+    app = create_app(external_base_url, tts_voice)
     app.run(host=host, port=port, debug=False)
