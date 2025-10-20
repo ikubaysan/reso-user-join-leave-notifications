@@ -2,8 +2,11 @@
 """
 Flask TTS API (OGG output, cached by username+action) with CLI flags.
 
-GET /api/tts?username=<str>&action=<join|leave>[&base_url=<http(s)://host:port>]
+GET /api/tts?username=<str>&action=<join|leave>[&base_url=<http(s)://host:port>][&force=1]
 → {"url": "<absolute URL to .ogg file>"}
+
+GET /api/voices
+→ JSON list of voices available to pyttsx3 (index, id, name, languages if available)
 
 Base URL precedence:
   1) Query param base_url (per-request override)
@@ -11,12 +14,15 @@ Base URL precedence:
   3) Default: Flask builds URL from the incoming request
 
 CLI:
-  python app.py --host 0.0.0.0 --port 4684 --external-base-url http://gallery.ikubaysan.com:4648 --tts-voice "zira"
+  python main.py --host 0.0.0.0 --port 4684 \
+    --external-base-url http://gallery.ikubaysan.com:4648 \
+    --tts-voice "us2" \
+    --force-recreate
 """
 
 from __future__ import annotations
-import os, re, threading, argparse
-from typing import Final, Literal, Optional, Tuple
+import os, re, threading, argparse, json
+from typing import Final, Literal, Optional, Tuple, List, Any
 from urllib.parse import urljoin
 from flask import Flask, jsonify, request, url_for, abort
 import pyttsx3
@@ -27,20 +33,44 @@ Action = Literal["join", "leave"]
 
 # ---------- CLI PARSER ----------
 
-def parse_args() ->  Tuple[str, int, str, str]:
+def parse_args() -> Tuple[str, int, str, str, Optional[int], bool]:
     parser = argparse.ArgumentParser(description="Start the TTS Flask server.")
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind (default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=4684, help="Port to bind (default: 4684)")
-    parser.add_argument("--tts-voice", dest="tts_voice", default="",
-                        help="Preferred TTS voice (substring or exact id), case-insensitive. Examples: 'zira', 'english-us', 'fiona'")
     parser.add_argument(
         "--external-base-url",
         default="",
         help="Optional absolute base URL for returned file links "
              "(e.g., http://gallery.ikubaysan.com:4648).",
     )
+    parser.add_argument(
+        "--tts-voice",
+        dest="tts_voice",
+        default="",
+        help="Preferred TTS voice (substring or exact id/name), case-insensitive. "
+             "Examples on Linux: 'us2' (MBROLA female-ish), 'en-us', etc."
+    )
+    parser.add_argument(
+        "--tts-voice-index",
+        dest="tts_voice_index",
+        type=int,
+        default=None,
+        help="Pick a voice by numeric index (as listed by /api/voices). Deterministic on Linux."
+    )
+    parser.add_argument(
+        "--force-recreate",
+        action="store_true",
+        help="Force re-generate audio even if the .ogg already exists."
+    )
     args = parser.parse_args()
-    return args.host, args.port, args.external_base_url.strip(), args.tts_voice.strip()
+    return (
+        args.host,
+        args.port,
+        args.external_base_url.strip(),
+        args.tts_voice.strip(),
+        args.tts_voice_index,
+        args.force_recreate,
+    )
 
 
 # ---------- UTILITIES ----------
@@ -117,25 +147,53 @@ class AudioSpec:
 
 
 class TTSGenerator:
-    """Thread-safe pyttsx3 wrapper that prefers Zira voice on Windows."""
+    """Thread-safe pyttsx3 wrapper.
 
-    def __init__(self, prefer_voice_substr: str = "zira", rate_delta: int = -20) -> None:
+    Selection order:
+      1) voice_index (exact index)
+      2) prefer_voice_substr (substring match in id or name, case-insensitive)
+      3) leave default
+    """
+
+    def __init__(
+        self,
+        prefer_voice_substr: str = "",
+        voice_index: Optional[int] = None,
+        rate_delta: int = -20,
+    ) -> None:
         self._engine = pyttsx3.init()
         self._lock = threading.Lock()
 
         try:
-            voices = self._engine.getProperty("voices") or []
+            voices: List[Any] = self._engine.getProperty("voices") or []
             chosen_id = None
-            needle = prefer_voice_substr.lower()
-            for v in voices:
-                if needle in (v.name or "").lower() or needle in (v.id or "").lower():
-                    chosen_id = v.id
-                    break
+
+            # 1) Pick by index if provided and valid
+            if voice_index is not None:
+                if 0 <= voice_index < len(voices):
+                    chosen_id = getattr(voices[voice_index], "id", None)
+                    print(f"[TTS] Using voice by index {voice_index}: {chosen_id}")
+                else:
+                    print(f"[TTS] Voice index {voice_index} out of range (0..{len(voices)-1}). Ignoring.")
+
+            # 2) Otherwise pick by substring (id or name)
+            if chosen_id is None and prefer_voice_substr:
+                needle = prefer_voice_substr.lower()
+                for v in voices:
+                    vid = (getattr(v, "id", "") or "").lower()
+                    vname = (getattr(v, "name", "") or "").lower()
+                    if needle in vid or needle in vname:
+                        chosen_id = v.id
+                        print(f"[TTS] Using voice by substring '{prefer_voice_substr}': {chosen_id}")
+                        break
+
+            # 3) Apply if we found something
             if chosen_id:
                 self._engine.setProperty("voice", chosen_id)
-                print(f"[TTS] Using voice: {chosen_id}")
             else:
-                print(f"[TTS] Preferred voice '{prefer_voice_substr}' not found; using default.")
+                if prefer_voice_substr or (voice_index is not None):
+                    print("[TTS] Preferred voice not found; using default voice.")
+
         except Exception as e:
             print(f"[TTS] Voice selection failed: {e}")
 
@@ -145,6 +203,21 @@ class TTSGenerator:
             print(f"[TTS] Set speech rate to {self._engine.getProperty('rate')}")
         except Exception as e:
             print(f"[TTS] Failed to set rate: {e}")
+
+    def list_voices(self) -> List[dict]:
+        out: List[dict] = []
+        try:
+            voices = self._engine.getProperty("voices") or []
+            for i, v in enumerate(voices):
+                out.append({
+                    "index": i,
+                    "id": getattr(v, "id", None),
+                    "name": getattr(v, "name", None),
+                    "languages": getattr(v, "languages", None),
+                })
+        except Exception as e:
+            out.append({"error": f"Failed to enumerate voices: {e}"})
+        return out
 
     def synthesize_to_wav(self, text: str, wav_path: str) -> None:
         ensure_parent_dir(wav_path)  # ensure folder exists (handles folder deletion mid-run)
@@ -161,9 +234,6 @@ class TTSGenerator:
         # Recreate audio dir if it was removed during runtime
         ensure_dir(spec.audio_dir)
 
-        if os.path.exists(spec.ogg_path):
-            return spec.ogg_path
-
         self.synthesize_to_wav(spec.phrase, spec.tmp_wav_path)
         try:
             self.wav_to_ogg(spec.tmp_wav_path, spec.ogg_path)
@@ -177,11 +247,12 @@ class TTSGenerator:
 
 
 class AudioService:
-    def __init__(self, audio_dir: str, tts: Optional[TTSGenerator] = None) -> None:
+    def __init__(self, audio_dir: str, tts: Optional[TTSGenerator] = None, force_recreate: bool = False) -> None:
         self.audio_dir: Final[str] = audio_dir
         self.tts: Final[TTSGenerator] = tts or TTSGenerator()
+        self.force_recreate_default: Final[bool] = force_recreate
 
-    def get_or_create_audio(self, username: str, action: str) -> str:
+    def get_or_create_audio(self, username: str, action: str, force: Optional[bool] = None) -> str:
         # Ensure audio folder still exists at request time
         ensure_dir(self.audio_dir)
 
@@ -189,31 +260,54 @@ class AudioService:
         if act not in ("join", "leave"):
             raise ValueError("Parameter 'action' must be 'join' or 'leave'.")
         spec = AudioSpec(username_raw=username, action=act, audio_dir=self.audio_dir)
+
+        force_flag = self.force_recreate_default if force is None else bool(force)
+
+        # If forcing recreate, delete any existing ogg
+        if force_flag and os.path.exists(spec.ogg_path):
+            try:
+                os.remove(spec.ogg_path)
+            except Exception as e:
+                print(f"[AudioService] Failed to remove existing file for force recreate: {e}")
+
         if os.path.exists(spec.ogg_path):
             return spec.ogg_path
+
         return self.tts.generate_ogg(spec)
 
 
 # ---------- FLASK FACTORY ----------
 
-
-def create_app(external_base_url: str = "", tts_voice: str = "") -> Flask:
+def create_app(
+    external_base_url: str = "",
+    tts_voice: str = "",
+    tts_voice_index: Optional[int] = None,
+    force_recreate: bool = False,
+) -> Flask:
     root, audio_dir = project_paths()
     app = Flask(__name__, static_url_path="/static", static_folder=os.path.join(root, "static"))
     app.config["EXTERNAL_BASE_URL"] = external_base_url
-    service = AudioService(audio_dir=audio_dir, tts=TTSGenerator(prefer_voice_substr=(tts_voice or "zira")))
+
+    # Init TTS with the user preferences
+    tts = TTSGenerator(prefer_voice_substr=(tts_voice or ""), voice_index=tts_voice_index)
+    service = AudioService(audio_dir=audio_dir, tts=tts, force_recreate=force_recreate)
 
     @app.get("/api/tts")
     def tts_endpoint():
         username = request.args.get("username", type=str)
         action = request.args.get("action", type=str)
         per_request_base = (request.args.get("base_url", type=str) or "").strip()
+        per_request_force = request.args.get("force", type=str)
 
         if not username or not action:
             return abort(400, description="Missing 'username' or 'action'.")
 
+        force_flag: Optional[bool] = None
+        if per_request_force is not None:
+            force_flag = per_request_force in ("1", "true", "True", "yes", "on")
+
         try:
-            ogg_path = service.get_or_create_audio(username=username, action=action)
+            ogg_path = service.get_or_create_audio(username=username, action=action, force=force_flag)
         except ValueError as e:
             return abort(400, description=str(e))
         except Exception as e:
@@ -224,6 +318,18 @@ def create_app(external_base_url: str = "", tts_voice: str = "") -> Flask:
         base_override = per_request_base or app.config.get("EXTERNAL_BASE_URL") or None
         file_url = build_file_url(app, rel_path, base_override)
         return jsonify({"url": file_url}), 200
+
+    @app.get("/api/voices")
+    def list_voices():
+        try:
+            voices = tts.list_voices()
+            return app.response_class(
+                response=json.dumps(voices, indent=2, ensure_ascii=False),
+                status=200,
+                mimetype="application/json",
+            )
+        except Exception as e:
+            return abort(500, description=f"Failed to list voices: {e}")
 
     @app.get("/")
     def health():
@@ -238,7 +344,13 @@ def create_app(external_base_url: str = "", tts_voice: str = "") -> Flask:
 
 
 # ---------- ENTRYPOINT ----------
+
 if __name__ == "__main__":
-    host, port, external_base_url, tts_voice = parse_args()
-    app = create_app(external_base_url, tts_voice)
+    host, port, external_base_url, tts_voice, tts_voice_index, force_recreate = parse_args()
+    app = create_app(
+        external_base_url=external_base_url,
+        tts_voice=tts_voice,
+        tts_voice_index=tts_voice_index,
+        force_recreate=force_recreate,
+    )
     app.run(host=host, port=port, debug=False)
