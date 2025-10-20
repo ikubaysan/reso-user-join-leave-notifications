@@ -23,19 +23,29 @@ import pyttsx3
 # ---------- Helpers ----------
 
 def get_voice_gender(voice) -> str | None:
-    """Return gender from voice metadata or inferred from id/name."""
-    gender = getattr(voice, "gender", None)
-    if gender:
-        return str(gender)
+    raw = getattr(voice, "gender", None)
+    vid = (getattr(voice, "id", "") or "").lower()
+    name = (getattr(voice, "name", "") or "").lower()
 
-    vid = getattr(voice, "id", "").lower()
-    name = getattr(voice, "name", "").lower()
+    # If espeak reports "male" but there’s no clear marker, treat as unknown.
+    if raw:
+        norm = str(raw).strip().lower()
+        if norm in {"female", "f"} and ("+f" in vid or "female" in name or vid.startswith("mb-")):
+            return "Female"
+        if norm in {"male", "m"} and ("+m" in vid or "male" in name or vid.startswith("mb-")):
+            return "Male"
+        # Fallthrough: espeak often says "male" for everything
+        # without any corroborating hint.
 
-    # Heuristics for Linux (espeak) and naming hints
-    if "+m" in vid or "male" in name:
+    # Heuristics (Linux/espeak-ng)
+    if "+m" in vid or " male" in name:
         return "Male"
-    if "+f" in vid or "female" in name:
+    if "+f" in vid or " female" in name:
         return "Female"
+    if vid.startswith("mb-"):
+        # Common mbrola mapping guesses:
+        # us2 is female; others vary by locale pack.
+        return "Female" if "-us2" in vid else "Unknown"
 
     return None
 
