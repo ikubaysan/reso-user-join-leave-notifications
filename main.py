@@ -153,7 +153,9 @@ def sanitize_username(username: str, max_len: int = 64) -> str:
     return s[:max_len] or "user"
 
 def build_phrase(username: str, action: Action) -> str:
-    return f"{username} has joined the session." if action == "join" else f"{username} has left the session."
+    #return f"{username} has joined the session." if action == "join" else f"{username} has left the session."
+    return f"Welcome, {username}" if action == "join" else f"Goodbye, {username}"
+    
 
 def is_valid_base_url(value: str) -> bool:
     if not value:
